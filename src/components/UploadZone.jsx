@@ -71,6 +71,7 @@ export default function UploadZone() {
                 navigate('/editor', {
                     state: {
                         fileName: data.file_name,
+                        serverFilename: data.server_filename,
                         fileUrl: data.file_url,
                         taskId: data.task_id
                     }

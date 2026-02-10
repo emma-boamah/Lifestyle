@@ -1,9 +1,10 @@
 import os
+import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from celery.result import AsyncResult
-from .tasks import ocr_process_pdf
+from .tasks import ocr_process_pdf, apply_pdf_changes
 
 
 @csrf_exempt
@@ -42,11 +43,45 @@ def upload_pdf(request):
         
         return JsonResponse({
             'task_id': task.id,
+            'server_filename': file_name, # Frontend needs this to save later
             'file_url': file_url,
             'file_name': uploaded_file.name
         })
     
     return JsonResponse({'error': 'Invalid request. POST with file required.'}, status=400)
+
+
+@csrf_exempt
+def save_pdf_edits(request):
+    """
+    Apply edits to a previously uploaded PDF.
+    
+    POST /api/save/
+    Body: {
+        "filename": "server_filename_from_upload.pdf",
+        "changes": [{ "page": 1, "x": 10, "y": 10, "w": 100, "h": 20, "text": "New Text" }]
+    }
+    """
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            filename = data.get('filename')
+            changes = data.get('changes', [])
+            
+            if not filename or not changes:
+                return JsonResponse({'error': 'Missing filename or changes'}, status=400)
+
+            file_path = os.path.join(settings.MEDIA_ROOT, 'uploads', filename)
+            
+            # Trigger the modification task
+            task = apply_pdf_changes.delay(file_path, changes)
+            
+            return JsonResponse({'task_id': task.id})
+            
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+            
+    return JsonResponse({'error': 'POST required'}, status=405)
 
 
 def task_status(request, task_id):
