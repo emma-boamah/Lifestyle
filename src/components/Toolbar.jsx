@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
     Type, Pen, Image, Square, Pencil, Highlighter, Download, Save, Share2,
     MousePointer, Hand, ZoomIn, ZoomOut, ChevronLeft, ChevronRight,
-    Undo, Redo, Printer, Loader
+    Undo, Redo, Printer, Loader, Pipette
 } from 'lucide-react';
 import { exportEditedPdf, downloadOriginalPdf } from '../utils/pdfExport';
 
@@ -17,7 +17,12 @@ export default function Toolbar({
     ocrData,
     editedBlocks,
     fileUrl,
-    fileName
+    fileName,
+    activeObject,
+    onUpdateObject,
+    defaultStyle,
+    setDefaultStyle,
+    onExport
 }) {
     const [isExporting, setIsExporting] = useState(false);
 
@@ -29,11 +34,18 @@ export default function Toolbar({
         { id: 'pen', icon: Pen, label: 'Pen' },
         { id: 'pencil', icon: Pencil, label: 'Pencil' },
         { id: 'highlight', icon: Highlighter, label: 'Highlight' },
+        { id: 'picker', icon: Pipette, label: 'Pick Color' },
         { id: 'image', icon: Image, label: 'Image' },
         { id: 'shape', icon: Square, label: 'Shape' }
     ];
 
     const handleExport = async () => {
+        if (onExport) {
+            onExport();
+            return;
+        }
+
+        // Fallback (should not be reached if onExport is passed)
         if (!fileUrl || !fileName) {
             alert('No PDF loaded to export');
             return;
@@ -122,7 +134,47 @@ export default function Toolbar({
             <div className="toolbar-divider"></div>
 
             {/* Actions */}
-            <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem' }}>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                {/* Style Controls */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem' }}>
+
+                    {/* Text Color Group */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', padding: '0.25rem', border: '1px solid #ddd', borderRadius: '4px' }}>
+                        <div className="color-picker-wrapper" title={`Text Color: ${activeObject?.fill || defaultStyle?.fill || '#000000'}`}>
+                            <Type size={16} />
+                            <input
+                                type="color"
+                                value={activeObject?.fill || defaultStyle?.fill || '#000000'}
+                                onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (onUpdateObject && activeObject) onUpdateObject({ fill: val });
+                                    if (setDefaultStyle) setDefaultStyle(prev => ({ ...prev, fill: val }));
+                                }}
+                                style={{ width: '24px', height: '24px', padding: 0, border: 'none', background: 'none' }}
+                            />
+                        </div>
+                    </div>
+
+                    {/* Background Color Group */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', padding: '0.25rem', border: '1px solid #ddd', borderRadius: '4px' }}>
+                        <div className="color-picker-wrapper" title={`Highlight/Background Color: ${activeObject?.backgroundColor === 'transparent' ? 'Transparent' : (activeObject?.backgroundColor || defaultStyle?.backgroundColor || '#ffffff')}`}>
+                            <Highlighter size={16} />
+                            <input
+                                type="color"
+                                value={activeObject?.backgroundColor === 'transparent' ? '#ffffff' : (activeObject?.backgroundColor || defaultStyle?.backgroundColor || '#ffffff')}
+                                onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (onUpdateObject && activeObject) onUpdateObject({ backgroundColor: val });
+                                    if (setDefaultStyle) setDefaultStyle(prev => ({ ...prev, backgroundColor: val }));
+                                }}
+                                style={{ width: '24px', height: '24px', padding: 0, border: 'none', background: 'none' }}
+                            />
+                        </div>
+                    </div>
+                </div>
+
+                <div className="toolbar-divider" style={{ marginRight: '0.5rem' }}></div>
+
                 <button className="tool-btn" title="Print" onClick={() => window.print()}>
                     <Printer size={18} />
                 </button>
