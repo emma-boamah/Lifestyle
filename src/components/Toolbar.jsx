@@ -22,7 +22,8 @@ export default function Toolbar({
     onUpdateObject,
     defaultStyle,
     setDefaultStyle,
-    onExport
+    onExport,
+    onSave
 }) {
     const [isExporting, setIsExporting] = useState(false);
 
@@ -70,8 +71,11 @@ export default function Toolbar({
     };
 
     const handleSave = () => {
-        // For now, just show a message
-        // In a full implementation, this would save to the backend
+        if (onSave) {
+            onSave();
+            return;
+        }
+
         const editCount = Object.keys(editedBlocks || {}).length;
         if (editCount > 0) {
             alert(`${editCount} text edit(s) saved locally. Click Export to download the modified PDF.`);

@@ -80,6 +80,8 @@ body {
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
 }
 
 /* Utility Classes */
@@ -509,8 +511,7 @@ body {
   box-shadow: var(--shadow-lg);
   border-radius: var(--radius-sm);
   min-height: 800px;
-  width: 100%;
-  max-width: 700px;
+  width: fit-content;
   position: relative;
 }
 
@@ -845,6 +846,33 @@ body {
 .ocr-text-block:focus {
   outline: 2px solid var(--color-primary);
   outline-offset: 1px;
+}
+
+/* Ensure react-pdf page has no internal spacing or shifting */
+.react-pdf__Page {
+  margin: 0 !important;
+  padding: 0 !important;
+  background-color: transparent !important;
+  display: block !important;
+  position: relative;
+  overflow: visible !important;
+}
+
+.react-pdf__Page__canvas {
+  display: block !important;
+  margin: 0 !important;
+  user-select: none;
+}
+
+/* Standardize the .canvas container */
+.canvas {
+  background: white;
+  box-shadow: var(--shadow-lg);
+  border-radius: var(--radius-sm);
+  width: fit-content;
+  margin: 0 auto;
+  position: relative;
+  line-height: 0; /* Remove any line-height spacing */
 }
 
 /* Toolbar enhancements */

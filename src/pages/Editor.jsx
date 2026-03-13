@@ -12,7 +12,8 @@ console.log('Editor.jsx: Loading component...');
 console.log('Editor.jsx: Fabric object:', fabric);
 
 // Set up the worker (vital for performance)
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+// Using a more robust worker URL strategy
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 export default function Editor() {
     console.log('Editor: Rendering...');
@@ -25,32 +26,67 @@ export default function Editor() {
         const canvas = fabricCanvasRef.current;
         const changes = [];
 
-        canvas.getObjects().forEach(obj => {
+        canvas.getObjects().forEach((obj, index) => {
+            // Only handle text objects (OCR blocks or user-added text)
+            if (obj.type !== 'i-text' && obj.type !== 'text' && obj.type !== 'textbox') return;
+
             if (obj.ocrBlockId && obj.originalState && obj.ocrScale) {
+                // Scenario 1: Modified OCR Block
+                // Fabric.js setZoom() stores coordinates in logical (un-zoomed) space.
+                // obj.left/top are in PDF points. We convert back to OCR pixel units.
                 const { x: scaleX, y: scaleY } = obj.ocrScale;
+
+                // Simple coordinate conversion as origin is now top-left
                 const currentX = obj.left / scaleX;
                 const currentY = obj.top / scaleY;
                 const currentW = (obj.width * obj.scaleX) / scaleX;
                 const currentH = (obj.height * obj.scaleY) / scaleY;
 
-                const isMoved = Math.abs(currentX - obj.originalState.x) > 1 || Math.abs(currentY - obj.originalState.y) > 1;
-                const isResized = Math.abs(currentW - obj.originalState.w) > 1 || Math.abs(currentH - obj.originalState.h) > 1;
+                const isMoved = Math.abs(currentX - obj.originalState.x) > 2 || Math.abs(currentY - obj.originalState.y) > 2;
+                const isResized = Math.abs(currentW - obj.originalState.w) > 2 || Math.abs(currentH - obj.originalState.h) > 2;
                 const isTextChanged = obj.text !== obj.originalState.text;
 
                 if (isMoved || isResized || isTextChanged) {
-                    const change = {
+                    changes.push({
+                        id: obj.ocrBlockId,
                         page: currentPage,
-                        x: currentX,
-                        y: currentY,
-                        w: currentW,
-                        h: currentH,
+                        x: isMoved ? currentX : obj.originalState.x,
+                        y: isMoved ? currentY : obj.originalState.y,
+                        w: isResized ? currentW : obj.originalState.w,
+                        h: isResized ? currentH : obj.originalState.h,
                         text: obj.text,
-                        font_size: (obj.fontSize * obj.scaleY) / scaleY,
-                        // Include original box for inpainting
+                        font_size: obj.fontSize / scaleY,
+                        fill_color: obj.fill || '#000000',
+                        bg_color: (obj.backgroundColor && obj.backgroundColor !== 'transparent') ? obj.backgroundColor : null,
+                        text_align: obj.textAlign || 'left',
                         original_box: [obj.originalState.x, obj.originalState.y, obj.originalState.w, obj.originalState.h]
-                    };
-                    changes.push(change);
+                    });
                 }
+            } else if (!obj.ocrBlockId) {
+                // Scenario 2: New User-Added Text
+                // Convert from PDF points to OCR pixel units
+                let scaleX = 72 / 150;
+                let scaleY = 72 / 150;
+
+                if (currentPageOcrData && pageDimensions) {
+                    scaleX = pageDimensions.width / currentPageOcrData.width;
+                    scaleY = pageDimensions.height / currentPageOcrData.height;
+                }
+
+                changes.push({
+                    id: `new_${currentPage}_${index}`,
+                    page: currentPage,
+                    x: obj.left / scaleX,
+                    y: obj.top / scaleY,
+                    w: (obj.width * obj.scaleX) / scaleX,
+                    h: (obj.height * obj.scaleY) / scaleY,
+                    text: obj.text,
+                    font_size: obj.fontSize / scaleY,
+                    fill_color: obj.fill || '#000000',
+                    bg_color: (obj.backgroundColor && obj.backgroundColor !== 'transparent') ? obj.backgroundColor : null,
+                    text_align: obj.textAlign || 'left',
+                    is_new: true
+                });
             }
         });
         return changes;
@@ -102,8 +138,10 @@ export default function Editor() {
     // Refactored Save Changes (Manual Save button)
     const handleSaveChanges = async () => {
         const changes = getChangesFromCanvas();
+        console.log('Editor: Saving changes:', changes);
+
         if (changes.length === 0) {
-            alert('No changes detected.');
+            alert('No changes detected. Please edit or move text before saving.');
             return;
         }
 
@@ -131,6 +169,10 @@ export default function Editor() {
     const [ocrData, setOcrData] = useState(null);
     const [editedBlocks, setEditedBlocks] = useState({});
 
+    // PDF Load Status
+    const [isPdfLoaded, setIsPdfLoaded] = useState(false);
+    const [pdfError, setPdfError] = useState(null);
+
     // Fabric.js State
     const fabricCanvasRef = useRef(null);
     const canvasElRef = useRef(null);
@@ -149,7 +191,8 @@ export default function Editor() {
 
     // Poll for OCR task status
     useEffect(() => {
-        if (!taskId) return;
+        console.log('Editor: OCR Polling check:', { taskId, isPdfLoaded, fileUrl, hasOcrData: !!ocrData });
+        if (!taskId || !isPdfLoaded || ocrData) return;
 
         setIsProcessing(true);
         setProcessingStatus('Starting OCR processing...');
@@ -207,15 +250,36 @@ export default function Editor() {
         pollStatus(); // Initial poll
 
         return () => clearInterval(intervalId);
-    }, [taskId]);
+    }, [taskId, isPdfLoaded, fileUrl]); // Added fileUrl just in case
 
     const onDocumentLoadSuccess = ({ numPages }) => {
         setNumPages(numPages);
+        setIsPdfLoaded(true);
+        setPdfError(null);
+    };
+
+    const onDocumentLoadError = (error) => {
+        console.error('PDF load error:', error);
+        setPdfError(error.message || 'Failed to load PDF file.');
+        setIsPdfLoaded(false);
+        setIsProcessing(false);
     };
 
     const onPageLoadSuccess = (page) => {
         const viewport = page.getViewport({ scale: 1 });
         setPageDimensions({ width: viewport.width, height: viewport.height });
+    };
+
+    const onPageRenderSuccess = (page) => {
+        // Use the actual rendered viewport to get the most accurate dimensions
+        const viewport = page.getViewport({ scale: zoom / 100 });
+        console.log('Editor: Page rendered. Dimensions:', { width: viewport.width, height: viewport.height });
+        
+        // Re-confirm base dimensions just in case
+        const baseViewport = page.getViewport({ scale: 1 });
+        if (!pageDimensions || pageDimensions.width !== baseViewport.width) {
+            setPageDimensions({ width: baseViewport.width, height: baseViewport.height });
+        }
     };
 
     // Get current page OCR data
@@ -275,6 +339,86 @@ export default function Editor() {
         canvas.on('selection:updated', handleObjectSelection);
         canvas.on('selection:cleared', () => setActiveObject(null));
 
+        // Add Listeners for Changes to sync with React state
+        const syncChanges = () => {
+            const currentChanges = getChangesFromCanvas();
+
+            setEditedBlocks(prev => {
+                const newMap = { ...prev };
+
+                // Get all block IDs on the CURRENT page from the canvas
+                const currentPageBlockIds = new Set();
+                canvas.getObjects().forEach(obj => {
+                    if (obj.ocrBlockId) currentPageBlockIds.add(obj.ocrBlockId);
+                });
+
+                // 1. Remove entries for the current page that are NO LONGER changed
+                // (This handles the case where a user reverts a change)
+                Object.keys(newMap).forEach(id => {
+                    if (currentPageBlockIds.has(id)) {
+                        delete newMap[id];
+                    }
+                });
+
+                // 2. Add current changes
+                currentChanges.forEach(change => {
+                    newMap[change.id] = change.text;
+                });
+
+                return newMap;
+            });
+        };
+
+        canvas.on('object:modified', syncChanges);
+        canvas.on('text:changed', syncChanges);
+        canvas.on('changed', syncChanges);
+        canvas.on('object:added', syncChanges);
+        canvas.on('object:removed', syncChanges);
+
+        // Text Tool: Add new Textbox on click (consistent with OCR blocks)
+        canvas.on('mouse:down', (opt) => {
+            // Only act when the text tool is active
+            if (activeToolRef.current !== 'text') return;
+
+            // Don't add a new textbox if the user clicked on an existing object
+            if (opt.target) return;
+
+            const pointer = canvas.getPointer(opt.e);
+            const zoom = canvas.getZoom();
+
+            const newText = new fabric.Textbox('Type here...', {
+                left: pointer.x,
+                top: pointer.y,
+                width: 200 / zoom, // A reasonable default width, normalized for zoom
+                fontSize: 16 / zoom,
+                fontFamily: 'DejaVu Sans',
+                lineHeight: 1,
+                charSpacing: 0,
+                padding: 0,
+                fill: defaultStyle?.fill || '#000000',
+                backgroundColor: defaultStyle?.backgroundColor === 'transparent' ? 'transparent' : (defaultStyle?.backgroundColor || 'transparent'),
+                opacity: 1,
+                editable: true,
+                selectable: true,
+                evented: true,
+                borderColor: '#2196F3',
+                cornerColor: '#2196F3',
+                cornerSize: 8,
+                transparentCorners: false,
+                lockRotation: true,
+                originX: 'left',
+                originY: 'top',
+                // No ocrBlockId — this marks it as a user-added object for getChangesFromCanvas
+            });
+
+            canvas.add(newText);
+            canvas.setActiveObject(newText);
+            // Enter editing mode immediately so the user can start typing
+            newText.enterEditing();
+            newText.selectAll();
+            canvas.requestRenderAll();
+        });
+
         fabricCanvasRef.current = canvas;
 
         // Re-apply current tool settings to the new canvas instance
@@ -295,7 +439,8 @@ export default function Editor() {
         return () => {
             // Save current page state before disposing
             if (fabricCanvasRef.current) {
-                canvasStates.current[currentPage] = fabricCanvasRef.current.toJSON();
+                // IMPORTANT: include custom properties in serialization
+                canvasStates.current[currentPage] = fabricCanvasRef.current.toJSON(['ocrBlockId', 'originalState', 'ocrScale']);
                 fabricCanvasRef.current.dispose();
                 fabricCanvasRef.current = null;
             }
@@ -320,13 +465,18 @@ export default function Editor() {
             canvas.freeDrawingBrush = new fabric.PencilBrush(canvas);
             canvas.freeDrawingBrush.color = 'red';
             canvas.freeDrawingBrush.width = 2;
+            canvas.defaultCursor = 'default';
+            canvas.selection = true;
         } else if (tool === 'highlight') {
             canvas.isDrawingMode = true;
             canvas.freeDrawingBrush = new fabric.PencilBrush(canvas);
             canvas.freeDrawingBrush.color = 'rgba(255, 255, 0, 0.5)';
             canvas.freeDrawingBrush.width = 20;
+            canvas.defaultCursor = 'default';
+            canvas.selection = true;
         } else if (tool === 'picker') {
             // Picker Tool: 
+            canvas.isDrawingMode = false;
             canvas.defaultCursor = 'crosshair';
             canvas.hoverCursor = 'crosshair';
             canvas.selection = false;
@@ -334,13 +484,23 @@ export default function Editor() {
                 obj.selectable = false;
                 obj.evented = false;
             });
+        } else if (tool === 'text') {
+            // Text Tool: Click on empty area adds a new Textbox
+            canvas.isDrawingMode = false;
+            canvas.defaultCursor = 'text';
+            canvas.hoverCursor = 'text';
+            canvas.selection = true;
         } else {
             canvas.isDrawingMode = false;
+            canvas.defaultCursor = 'default';
+            canvas.hoverCursor = 'move';
+            canvas.selection = true;
         }
 
-        // 2. Update Interactivity of Text Blocks based on Tool
+        // 2. Update Interactivity of ALL Text Blocks based on Tool
         canvas.getObjects().forEach(obj => {
-            if (obj.ocrBlockId) {
+            // Handle both OCR blocks and user-added text objects
+            if (obj.type === 'textbox' || obj.type === 'i-text' || obj.type === 'text') {
                 if (tool === 'text') {
                     // Text Tool: Full editing
                     obj.set({
@@ -354,14 +514,14 @@ export default function Editor() {
                     obj.set({
                         selectable: true,
                         evented: true,
-                        editable: false, // Prevents entering text edit mode easily
+                        editable: false,
                         hoverCursor: 'move'
                     });
                 } else {
-                    // Drawing/Others: Text is distinct background
+                    // Drawing/Others: Text is non-interactive
                     obj.set({
                         selectable: false,
-                        evented: false, // Events pass through to canvas (for drawing)
+                        evented: false,
                         editable: false,
                         hoverCursor: 'default'
                     });
@@ -421,9 +581,9 @@ export default function Editor() {
 
         const canvas = fabricCanvasRef.current;
 
-        // 1. Calculate Scale Factors
-        const scaleX = canvas.width / currentPageOcrData.width;
-        const scaleY = canvas.height / currentPageOcrData.height;
+        // 1. Calculate Scale Factors relative to base page dimensions (NOT zoomed canvas)
+        const scaleX = pageDimensions.width / currentPageOcrData.width;
+        const scaleY = pageDimensions.height / currentPageOcrData.height;
 
         // 2. Clear existing OCR objects
         const existingObjects = canvas.getObjects();
@@ -443,17 +603,25 @@ export default function Editor() {
         currentPageOcrData.text_blocks.forEach(block => {
             const textObj = new fabric.Textbox(block.text, {
                 left: block.rect.x * scaleX,
-                top: block.rect.y * scaleY,
+                padding: 0,
                 width: block.rect.width * scaleX,
                 height: block.rect.height * scaleY,
-                fontSize: (block.rect.height * scaleY) * 0.8,
-                fontFamily: 'Arial',
+                // USE THE ACTUAL DETECTED FONT SIZE FROM OCR
+                fontSize: block.font_size * scaleY,
+                fontFamily: 'DejaVu Sans',
+                lineHeight: 1,
+                charSpacing: 0,
+                textAlign: block.text_align || 'left',
                 // Visibility Logic
                 opacity: 0,
                 // Use detected colors or defaults
                 fill: block.fg_color || '#000000',
                 backgroundColor: block.bg_color || 'rgba(255, 255, 255, 1)',
-
+                // Match the backend's middle anchoring strategy visually
+                originX: 'left',
+                originY: 'top',
+                top: block.rect.y * scaleY,
+                
                 // Interactivity Logic
                 selectable: isTextTool || isSelectTool,
                 evented: isTextTool || isSelectTool,
@@ -489,11 +657,19 @@ export default function Editor() {
 
             // Handle deselection
             textObj.on('deselected', () => {
-                if (textObj.text !== textObj.originalState.text) {
-                    textObj.set({ opacity: 1 });
-                } else {
-                    textObj.set({ opacity: 0 });
-                }
+                const { x: sX, y: sY } = textObj.ocrScale;
+                const cX = textObj.left / sX;
+                const cY = textObj.top / sY;
+                const cW = (textObj.width * textObj.scaleX) / sX;
+                const cH = (textObj.height * textObj.scaleY) / sY;
+
+                const isModified = Math.abs(cX - textObj.originalState.x) > 1 ||
+                    Math.abs(cY - textObj.originalState.y) > 1 ||
+                    Math.abs(cW - textObj.originalState.w) > 1 ||
+                    Math.abs(cH - textObj.originalState.h) > 1 ||
+                    textObj.text !== textObj.originalState.text;
+
+                textObj.set({ opacity: isModified ? 1 : 0 });
                 canvas.requestRenderAll();
             });
 
@@ -546,7 +722,7 @@ export default function Editor() {
             <Sidebar />
 
             <div className="editor-main">
-                <div className="editor-header">
+                <div className="editor-header" style={{ position: 'relative', zIndex: 100 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
                         <button
                             onClick={() => navigate('/')}
@@ -594,6 +770,7 @@ export default function Editor() {
                 </div>
 
                 <Toolbar
+                    style={{ position: 'relative', zIndex: 90 }}
                     activeTool={activeTool}
                     onToolChange={setActiveTool}
                     zoom={zoom}
@@ -610,6 +787,7 @@ export default function Editor() {
                     defaultStyle={defaultStyle}
                     setDefaultStyle={setDefaultStyle}
                     onExport={handleBackendExport}
+                    onSave={handleSaveChanges}
                 />
 
                 <div className="canvas-area" onClick={handleCanvasClick}>
@@ -636,32 +814,42 @@ export default function Editor() {
 
                         {/* PDF Viewer with OCR Overlay */}
                         {fileUrl ? (
-                            <div style={{ position: 'relative' }}>
+                            <div className="pdf-viewer-container" style={{ position: 'relative', display: 'inline-block' }}>
                                 <Document
                                     file={fileUrl}
                                     onLoadSuccess={onDocumentLoadSuccess}
+                                    onLoadError={onDocumentLoadError}
+                                    loading={<div className="pdf-loading">Loading PDF Viewer...</div>}
+                                    error={<div className="pdf-error">{pdfError || 'Failed to load PDF file.'}</div>}
                                 >
-                                    <Page
-                                        pageNumber={currentPage}
-                                        scale={zoom / 100}
-                                        renderTextLayer={false}
-                                        renderAnnotationLayer={false}
-                                        onLoadSuccess={onPageLoadSuccess}
-                                    />
-                                </Document>
-
-                                {/* Fabric.js Drawing Layer */}
-                                {pageDimensions && (
-                                    <div style={{
-                                        position: 'absolute',
-                                        top: 0,
-                                        left: 0,
-                                        zIndex: 20,
-                                        pointerEvents: (activeTool === 'pen' || activeTool === 'highlight' || activeTool === 'text' || activeTool === 'select' || activeTool === 'picker') ? 'auto' : 'none'
-                                    }}>
-                                        <canvas ref={canvasElRef} />
+                                    <div style={{ position: 'relative' }}>
+                                        <Page
+                                            pageNumber={currentPage}
+                                            scale={zoom / 100}
+                                            renderTextLayer={false}
+                                            renderAnnotationLayer={false}
+                                            onLoadSuccess={onPageLoadSuccess}
+                                            onRenderSuccess={onPageRenderSuccess}
+                                            className="pdf-page"
+                                        />
+                                        
+                                        {/* Fabric.js Drawing Overlay */}
+                                        {/* Ensuring dimensions exactly match the rendered Page size */}
+                                        {pageDimensions && (
+                                            <div style={{
+                                                position: 'absolute',
+                                                top: 0,
+                                                left: 0,
+                                                width: `${pageDimensions.width * (zoom / 100)}px`,
+                                                height: `${pageDimensions.height * (zoom / 100)}px`,
+                                                zIndex: 20,
+                                                pointerEvents: (activeTool === 'pen' || activeTool === 'highlight' || activeTool === 'text' || activeTool === 'select' || activeTool === 'picker') ? 'auto' : 'none'
+                                            }}>
+                                                <canvas ref={canvasElRef} />
+                                            </div>
+                                        )}
                                     </div>
-                                )}
+                                </Document>
                             </div>
                         ) : (
                             <div style={{
