@@ -32,8 +32,8 @@ def ocr_process_pdf(self, file_path):
         # Update state
         self.update_state(state='PROCESSING', meta={'status': 'Converting PDF to images...'})
         
-        # Convert PDF pages to images (requires poppler-utils installed on OS)
-        images = convert_from_path(file_path, dpi=150)
+        # Convert PDF pages to images (using CropBox to match visible coordinates)
+        images = convert_from_path(file_path, dpi=150, use_cropbox=True)
         
         output = {
             'page_count': len(images),
@@ -63,16 +63,26 @@ def ocr_process_pdf(self, file_path):
                 'text_blocks': []
             }
 
-            # Get the corresponding PDF page for color detection
+            # Get the corresponding PDF page for color detection and native text
             if i < len(doc):
                 pdf_page = doc[i]
                 # Calculate scale factors: PDF points / Image pixels
                 scale_x = pdf_page.rect.width / img.width
                 scale_y = pdf_page.rect.height / img.height
+                
+                # Extract native text spans for alignment
+                native_dict = pdf_page.get_text("dict")
+                native_spans = []
+                for b in native_dict.get("blocks", []):
+                    if b["type"] == 0:  # Text block
+                        for l in b.get("lines", []):
+                            for s in l.get("spans", []):
+                                native_spans.append(s)
             else:
                 pdf_page = None
                 scale_x = 1.0
                 scale_y = 1.0
+                native_spans = []
 
             for bbox, text, conf in results:
                 # Clean up data for JSON serialization (numpy ints/floats to python native)
@@ -88,29 +98,78 @@ def ocr_process_pdf(self, file_path):
                 rect_w = max(x_coords) - rect_x
                 rect_h = max(y_coords) - rect_y
 
-                # Detect Colors
+                # Detect Colors and potentially refine coordinates from native text
                 fg_color = '#000000' # Default Black
                 bg_color = '#ffffff' # Default White
+                font_size = rect_h * 0.8 # Default fallback
+                text_align = 'left'
                 
-                if pdf_page:
-                    # Convert image rect to PDF rect
-                    pdf_rect = fitz.Rect(
-                        rect_x * scale_x,
-                        rect_y * scale_y,
-                        (rect_x + rect_w) * scale_x,
+                # REFINEMENT: Match OCR text with native PDF spans
+                matched_span = None
+                if native_spans:
+                    # Match based on spatial overlap and text content similarity
+                    # We look for a native span that roughly overlaps with our OCR rect
+                    ocr_rect_pdf = fitz.Rect(
+                        rect_x * scale_x, 
+                        rect_y * scale_y, 
+                        (rect_x + rect_w) * scale_x, 
                         (rect_y + rect_h) * scale_y
                     )
                     
-                    # Detect colors
-                    bg_rgb, fg_rgb = detect_colors_in_rect(pdf_page, pdf_rect)
+                    best_overlap = 0
+                    for span in native_spans:
+                        span_rect = fitz.Rect(span["bbox"])
+                        intersect = ocr_rect_pdf & span_rect
+                        if not intersect.is_empty:
+                            overlap = intersect.width * intersect.height
+                            if overlap > best_overlap:
+                                # String overlap check (fuzzy-ish)
+                                if span["text"].strip() in text or text in span["text"].strip():
+                                    best_overlap = overlap
+                                    matched_span = span
+
+                if matched_span:
+                    # USE NATIVE COORDINATES (converted back to OCR pixels)
+                    # This provides pixel-perfect alignment for existing text
+                    # We must subtract the page origin (x0, y0) because the image is the CropBox area
+                    s_bbox = matched_span["bbox"]
+                    rect_x = (s_bbox[0] - pdf_page.rect.x0) / scale_x
+                    rect_y = (s_bbox[1] - pdf_page.rect.y0) / scale_y
+                    rect_w = (s_bbox[2] - s_bbox[0]) / scale_x
+                    rect_h = (s_bbox[3] - s_bbox[1]) / scale_y
                     
-                    # Convert to Hex
+                    # Use native style
+                    font_size = matched_span.get('size', 12) * (150 / 72)
+                    color_int = matched_span.get('color', 0)
+                    fg_rgb = fitz.sRGB_to_pdf(color_int)
+                    fg_color = '#{:02x}{:02x}{:02x}'.format(
+                        int(fg_rgb[0] * 255), int(fg_rgb[1] * 255), int(fg_rgb[2] * 255)
+                    )
+                    
+                    # Sample background around the native rect
+                    bg_rgb, _, _ = detect_style_in_rect(pdf_page, fitz.Rect(s_bbox))
+                    bg_color = '#{:02x}{:02x}{:02x}'.format(
+                        int(bg_rgb[0] * 255), int(bg_rgb[1] * 255), int(bg_rgb[2] * 255)
+                    )
+                elif pdf_page:
+                    # Fallback to current detect_style_in_rect if no direct span match
+                    # We must add the page origin as rect_x/y are relative to the image (CropBox)
+                    pdf_rect = fitz.Rect(
+                        rect_x * scale_x + pdf_page.rect.x0,
+                        rect_y * scale_y + pdf_page.rect.y0,
+                        (rect_x + rect_w) * scale_x + pdf_page.rect.x0,
+                        (rect_y + rect_h) * scale_y + pdf_page.rect.y0
+                    )
+                    
+                    bg_rgb, fg_rgb, detected_font_size = detect_style_in_rect(pdf_page, pdf_rect)
+                    
                     fg_color = '#{:02x}{:02x}{:02x}'.format(
                         int(fg_rgb[0] * 255), int(fg_rgb[1] * 255), int(fg_rgb[2] * 255)
                     )
                     bg_color = '#{:02x}{:02x}{:02x}'.format(
                         int(bg_rgb[0] * 255), int(bg_rgb[1] * 255), int(bg_rgb[2] * 255)
                     )
+                    font_size = detected_font_size * (150 / 72)
 
                 page_data['text_blocks'].append({
                     'id': f'page{i+1}_block{len(page_data["text_blocks"])}',
@@ -119,6 +178,8 @@ def ocr_process_pdf(self, file_path):
                     'bbox': clean_bbox,
                     'fg_color': fg_color,
                     'bg_color': bg_color,
+                    'font_size': font_size,
+                    'text_align': text_align,
                     # Simplified rectangle for easier positioning
                     'rect': {
                         'x': rect_x,
@@ -138,27 +199,30 @@ def ocr_process_pdf(self, file_path):
         return {'error': str(e)}
 
 
-def detect_colors_in_rect(page, rect):
+def detect_style_in_rect(page, rect):
     """
-    Returns (background_rgb, foreground_rgb) tuples (0.0-1.0).
-    Defaulting to (White, Black) if nothing is found.
+    Returns (background_rgb, foreground_rgb, font_size) tuples.
+    Defaulting to (White, Black, 12pt) if nothing is found.
     """
     bg = (1, 1, 1)  # White
     fg = (0, 0, 0)  # Black
+    font_size = 12
     
     try:
-        # Get text dictionary in the area to find font color
+        # Get text dictionary in the area to find font color and size
         text_dict = page.get_text("dict", clip=rect)
         for block in text_dict.get("blocks", []):
+            if block["type"] != 0: continue # 0 is text block
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     # PyMuPDF colors are integers; convert to RGB tuple
                     color_int = span.get('color', 0)
                     fg = fitz.sRGB_to_pdf(color_int)
-                    return bg, fg
+                    font_size = span.get('size', 12)
+                    return bg, fg, font_size
     except Exception:
         pass
-    return bg, fg
+    return bg, fg, font_size
 
 
 @shared_task(bind=True)
@@ -176,9 +240,8 @@ def apply_pdf_changes(self, file_path, changes):
     try:
         self.update_state(state='PROCESSING', meta={'status': 'Converting PDF to images...'})
         
-        # 1. Convert PDF to images (using same DPI as OCR to match coordinates)
-        # We use 150 DPI as established in ocr_process_pdf
-        images = convert_from_path(file_path, dpi=150)
+        # 1. Convert PDF to images (using same DPI and CropBox as OCR to match coordinates)
+        images = convert_from_path(file_path, dpi=150, use_cropbox=True)
         
         # 2. Group changes by page
         changes_by_page = {}

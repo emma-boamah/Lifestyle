@@ -2,95 +2,221 @@
 ocr_editor_backend.py
 
 This module handles the image processing required to edit text in scanned documents.
-It uses OpenCV for removing original text (inpainting) and Pillow for high-quality
-text overlay.
+It uses Pillow to:
+  1. Erase old text by filling original regions with the background color.
+  2. Draw new/replacement text at the target position.
 """
 
-import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
 
-def clean_background_region(image_cv, x, y, w, h):
+
+def _get_font(font_size):
     """
-    Erases text from a specific region using Navier-Stokes inpainting.
+    Get a font at the specified size. Tries common font paths in order.
     """
-    # Create a mask for the region to be cleaned
-    mask = np.zeros(image_cv.shape[:2], dtype=np.uint8)
+    font_candidates = [
+        # Project-local font
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static", "fonts", "arial.ttf"),
+        # System fonts (Linux)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
     
-    # We expand the box slightly (pad) to ensure we catch edge pixels of the text
-    pad = 3
+    for path in font_candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, font_size)
+            except IOError:
+                continue
     
-    # Ensure coordinates are within image bounds
-    y1 = max(0, y - pad)
-    y2 = min(image_cv.shape[0], y + h + pad)
+    # Ultimate fallback
+    return ImageFont.load_default()
+
+
+def _hex_to_rgb(hex_color):
+    """Convert hex color string to RGB tuple."""
+    if not hex_color or not hex_color.startswith('#'):
+        return (0, 0, 0)
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) != 6:
+        return (0, 0, 0)
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _sample_background_color(pil_image, x, y, w, h):
+    """
+    Sample the dominant background color around a text region.
+    Takes pixels from the edges of the region to estimate the background.
+    Returns an RGB tuple.
+    """
+    img_w, img_h = pil_image.size
+    pixels = []
+    
+    # Sample pixels from a thin border around the region
+    pad = 2
     x1 = max(0, x - pad)
-    x2 = min(image_cv.shape[1], x + w + pad)
+    y1 = max(0, y - pad)
+    x2 = min(img_w - 1, x + w + pad)
+    y2 = min(img_h - 1, y + h + pad)
     
-    # Set the region in the mask to white (255)
-    mask[y1:y2, x1:x2] = 255
+    # Sample top edge
+    for sx in range(x1, x2, 2):
+        if 0 <= y1 < img_h:
+            pixels.append(pil_image.getpixel((sx, y1))[:3])
+    # Sample bottom edge
+    for sx in range(x1, x2, 2):
+        if 0 <= y2 < img_h:
+            pixels.append(pil_image.getpixel((sx, y2))[:3])
+    # Sample left edge
+    for sy in range(y1, y2, 2):
+        if 0 <= x1 < img_w:
+            pixels.append(pil_image.getpixel((x1, sy))[:3])
+    # Sample right edge
+    for sy in range(y1, y2, 2):
+        if 0 <= x2 < img_w:
+            pixels.append(pil_image.getpixel((x2, sy))[:3])
     
-    # Apply inpainting
-    # radius=3 is typically good for text removal
-    inpainted_img = cv2.inpaint(image_cv, mask, 3, cv2.INPAINT_NS)
+    if not pixels:
+        return (255, 255, 255)  # Default white
     
-    return inpainted_img
+    # Robust median sampling:
+    # Instead of bright pixel thresholds (which fail on tinted documents),
+    # we take all sampled pixels, sort them, and take the median.
+    # We can also trim extreme values (dark text, bright noise) for better accuracy.
+    pixels_arr = np.array(pixels)
+    if len(pixels_arr) > 10:
+        # Sort by brightness (sum of RGB)
+        brightness = np.sum(pixels_arr, axis=1)
+        sorted_indices = np.argsort(brightness)
+        sorted_pixels = pixels_arr[sorted_indices]
+        
+        # Trim the darkest 20% (likely text) and brightest 5% (noise)
+        low_idx = int(len(sorted_pixels) * 0.20)
+        high_idx = int(len(sorted_pixels) * 0.95)
+        trimmed_pixels = sorted_pixels[low_idx:high_idx]
+        
+        if len(trimmed_pixels) > 0:
+            median_color = tuple(int(v) for v in np.median(trimmed_pixels, axis=0))
+        else:
+            median_color = tuple(int(v) for v in np.median(pixels_arr, axis=0))
+    else:
+        median_color = tuple(int(v) for v in np.median(pixels_arr, axis=0))
+        
+    return median_color
+
 
 def process_pil_image(pil_image, edits):
     """
     Process a single PIL image: erase old text and draw new text.
     Returns a new PIL image.
+    
+    Each edit dict can have:
+        - x, y, w, h: Position/size in OCR pixel coordinates (150 DPI)
+        - text: The new text content
+        - font_size: Font size in OCR pixel units
+        - original_box: [x, y, w, h] of the original text region to erase
+        - is_new: If True, this is user-added text (skip erasing)
+        - fill_color: Hex color for text (default: #000000)
+        - bg_color: Hex color for background fill behind text
+        - text_align: Alignment ('left', 'center', 'right'). Default: 'left'
     """
-    # 1. Convert PIL (RGB) to OpenCV (BGR)
-    img_array = np.array(pil_image)
-    # Handle RGB vs RGBA
-    if img_array.shape[2] == 4:
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
-    else:
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
-    # 2. Pass 1: Erase old text (Inpainting)
-    for edit in edits:
-        # Use 'original_box' if available (from resize), else use current x,y,w,h
-        if 'original_box' in edit:
-            x, y, w, h = edit['original_box']
-        else:
-            x = int(edit.get('x', 0))
-            y = int(edit.get('y', 0))
-            w = int(edit.get('w', 0))
-            h = int(edit.get('h', 0))
-            
-        img_cv = clean_background_region(img_cv, int(x), int(y), int(w), int(h))
-
-    # 3. Convert back to PIL (BGR -> RGB) for text drawing
-    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    pil_img_out = Image.fromarray(img_cv)
+    # Work on a copy
+    pil_img_out = pil_image.copy()
+    if pil_img_out.mode == 'RGBA':
+        pil_img_out = pil_img_out.convert('RGB')
+    
     draw = ImageDraw.Draw(pil_img_out)
 
-    # 4. Setup Font
-    # Point to a specific .ttf file for production environment
-    # Assuming standard structure: /var/www/lifestyle/static/fonts/arial.ttf
-    font_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static", "fonts", "arial.ttf")
-    
-    try:
-        base_font = ImageFont.truetype(font_path, 20)
-    except IOError:
-        # Fallback if specific font is not found
-        base_font = ImageFont.load_default()
+    # Pass 1: Erase old text regions with background color fill
+    for edit in edits:
+        # Skip erasing for new user-added text
+        if edit.get('is_new', False):
+            continue
+        
+        # Determine the region to erase (original_box = old position)
+        if 'original_box' in edit:
+            ox, oy, ow, oh = [int(v) for v in edit['original_box']]
+        else:
+            ox = int(edit.get('x', 0))
+            oy = int(edit.get('y', 0))
+            ow = int(edit.get('w', 0))
+            oh = int(edit.get('h', 0))
+        
+        # Determine the fill color: use provided bg_color if available, else sample
+        bg_color_hex = edit.get('bg_color')
+        if bg_color_hex:
+            bg_sampled = _hex_to_rgb(bg_color_hex)
+        else:
+            bg_sampled = _sample_background_color(pil_img_out, ox, oy, ow, oh)
+        
+        # Erase by filling with background color (pad slightly more to ensure full coverage)
+        pad = 4
+        x1 = max(0, ox - pad)
+        y1 = max(0, oy - pad)
+        x2 = ox + ow + pad
+        y2 = oy + oh + pad
+        draw.rectangle([x1, y1, x2, y2], fill=bg_sampled)
 
-    # 5. Pass 2: Overlay new text
+    # Pass 2: Draw new/replacement text
     for edit in edits:
         x = int(edit.get('x', 0))
         y = int(edit.get('y', 0))
+        w = int(edit.get('w', 0))
+        h = int(edit.get('h', 0))
         text_content = edit.get('text', '')
-        font_size = int(edit.get('font_size', 20))
+        font_size = int(edit.get('font_size', 16))
         
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except:
-            font = base_font
-
-        # Draw the text (Black color for now, can be parameterized)
-        draw.text((x, y), text_content, fill="black", font=font)
+        # Get colors
+        fill_color = edit.get('fill_color', '#000000')
+        bg_color = edit.get('bg_color', None)
+        
+        # Get font with size correction (Frontend sends pixels @ 150 DPI, Pillow expects points @ 72 DPI)
+        # However, Pillow's truetype size is usually interpreted as pixels if no DPI is specified.
+        # But for consistency with standard rendering, we ensure a healthy minimum.
+        font_size = max(8, font_size)
+        font = _get_font(font_size)
+        
+        # Alignment handling
+        text_align = edit.get('text_align', 'left').lower()
+        
+        # For any modified text block, fill the target area with background first IF provided
+        # This helps cover any missed stray pixels from the original text
+        if bg_color and bg_color != 'transparent':
+            bg_rgb = _hex_to_rgb(bg_color)
+            draw.rectangle([x, y, x + w, y + h], fill=bg_rgb)
+        
+        # Draw the text
+        text_rgb = _hex_to_rgb(fill_color)
+        
+        # Get the width of the text with the current font
+        # Use getlength for consistency and accuracy in pixel width
+        text_width = font.getlength(text_content)
+        
+        # 1. Best-Fit Font Scaling:
+        # If text is too wide for the box, reduce font size until it fits
+        while text_width > w and font_size > 6:
+            font_size -= 1
+            font = _get_font(font_size)
+            text_width = font.getlength(text_content)
+            
+        # 2. Alignment Anchor logic:
+        # We always center vertically in the box for visual consistency with OCR
+        center_y = y + (h / 2)
+        
+        if text_align == 'center':
+            draw_pos = (x + (w / 2), center_y)
+            anchor_point = "mm" # Middle-middle
+        elif text_align == 'right':
+            draw_pos = (x + w, center_y)
+            anchor_point = "rm" # Right-middle
+        else: # Default left
+            draw_pos = (x, center_y)
+            anchor_point = "lm" # Left-middle
+        
+        # Draw the text using the calculated anchor
+        draw.text(draw_pos, text_content, fill=text_rgb, font=font, anchor=anchor_point)
         
     return pil_img_out
