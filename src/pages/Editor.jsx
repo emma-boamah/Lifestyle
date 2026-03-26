@@ -8,6 +8,18 @@ import Toolbar from '../components/Toolbar';
 import PropertiesPanel from '../components/PropertiesPanel';
 import { savePdfChanges, pollTaskStatus } from '../utils/backendApi';
 
+// Add new API helper for targeted OCR
+const startTargetedOcr = async (filename, page, rect) => {
+    const response = await fetch('/api/ocr/targeted/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename, page, rect })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to start targeted OCR');
+    return data.task_id;
+};
+
 console.log('Editor.jsx: Loading component...');
 console.log('Editor.jsx: Fabric object:', fabric);
 
@@ -37,13 +49,19 @@ export default function Editor() {
                 const { x: scaleX, y: scaleY } = obj.ocrScale;
 
                 // Simple coordinate conversion as origin is now top-left
-                const currentX = obj.left / scaleX;
+                const currentX = (obj.left / scaleX) - 1; // Nudge 1 pixel left to be safe
                 const currentY = obj.top / scaleY;
                 const currentW = (obj.width * obj.scaleX) / scaleX;
                 const currentH = (obj.height * obj.scaleY) / scaleY;
 
                 const isMoved = Math.abs(currentX - obj.originalState.x) > 2 || Math.abs(currentY - obj.originalState.y) > 2;
-                const isResized = Math.abs(currentW - obj.originalState.w) > 2 || Math.abs(currentH - obj.originalState.h) > 2;
+                // CRITICAL FIX: fabric.Textbox organically recalculates its own height based on fonts.
+                // We must ONLY flag a block strictly if the user dragged the width specifically, or else it triggers 
+                // a false positive for EVERY SINGLE BLOCK on the page!
+                // Add a tolerance check. 
+                // If the difference is roughly our 10px buffer, don't treat it as a 'User Resize'
+                const bufferTolerance = 12 / scaleX; 
+                const isResized = Math.abs(currentW - obj.originalState.w) > bufferTolerance;
                 const isTextChanged = obj.text !== obj.originalState.text;
 
                 if (isMoved || isResized || isTextChanged) {
@@ -54,6 +72,21 @@ export default function Editor() {
                         y: isMoved ? currentY : obj.originalState.y,
                         w: isResized ? currentW : obj.originalState.w,
                         h: isResized ? currentH : obj.originalState.h,
+
+                        // NEW PERCENTAGE-BASED COORDINATES
+                        x_percent: (isMoved ? obj.left : (obj.originalState.x * scaleX)) / pageDimensions.width,
+                        y_percent: (isMoved ? obj.top : (obj.originalState.y * scaleY)) / pageDimensions.height,
+                        w_percent: (isResized ? (obj.width * obj.scaleX) : (obj.originalState.w * scaleX)) / pageDimensions.width,
+                        h_percent: (isResized ? (obj.height * obj.scaleY) : (obj.originalState.h * scaleY)) / pageDimensions.height,
+                        font_size_percent: obj.fontSize / pageDimensions.height,
+
+                        original_box_percent: [
+                            (obj.originalState.x * scaleX) / pageDimensions.width,
+                            (obj.originalState.y * scaleY) / pageDimensions.height,
+                            (obj.originalState.w * scaleX) / pageDimensions.width,
+                            (obj.originalState.h * scaleY) / pageDimensions.height
+                        ],
+
                         text: obj.text,
                         font_size: obj.fontSize / scaleY,
                         fill_color: obj.fill || '#000000',
@@ -80,6 +113,14 @@ export default function Editor() {
                     y: obj.top / scaleY,
                     w: (obj.width * obj.scaleX) / scaleX,
                     h: (obj.height * obj.scaleY) / scaleY,
+
+                    // NEW PERCENTAGE-BASED COORDINATES
+                    x_percent: obj.left / pageDimensions.width,
+                    y_percent: obj.top / pageDimensions.height,
+                    w_percent: (obj.width * obj.scaleX) / pageDimensions.width,
+                    h_percent: (obj.height * obj.scaleY) / pageDimensions.height,
+                    font_size_percent: obj.fontSize / pageDimensions.height,
+
                     text: obj.text,
                     font_size: obj.fontSize / scaleY,
                     fill_color: obj.fill || '#000000',
@@ -268,13 +309,28 @@ export default function Editor() {
     const onPageLoadSuccess = (page) => {
         const viewport = page.getViewport({ scale: 1 });
         setPageDimensions({ width: viewport.width, height: viewport.height });
+
+        // Auto-scale to fit container nicely (browser-like behavior)
+        const container = document.querySelector('.canvas-area');
+        if (container && zoom === 100) {
+            // We want the PDF to take up a substantial portion of the screen width 
+            // accounting for sidebar and padding. 0.8 is a good comfortable margin.
+            const targetWidth = container.clientWidth * 0.8;
+            const newScale = targetWidth / viewport.width;
+            
+            // Convert to percentage and cap reasonably between 100% and 250%
+            let newZoom = Math.round(newScale * 100);
+            newZoom = Math.max(100, Math.min(newZoom, 250)); 
+            
+            setZoom(newZoom);
+        }
     };
 
     const onPageRenderSuccess = (page) => {
         // Use the actual rendered viewport to get the most accurate dimensions
         const viewport = page.getViewport({ scale: zoom / 100 });
         console.log('Editor: Page rendered. Dimensions:', { width: viewport.width, height: viewport.height });
-        
+
         // Re-confirm base dimensions just in case
         const baseViewport = page.getViewport({ scale: 1 });
         if (!pageDimensions || pageDimensions.width !== baseViewport.width) {
@@ -308,15 +364,17 @@ export default function Editor() {
         if (!pageDimensions || !canvasElRef.current) return;
 
         const scale = zoom / 100;
-        const width = pageDimensions.width * scale;
-        const height = pageDimensions.height * scale;
+        const CANVAS_PADDING = 40; // Add breathing room for selection handles
+
+        const width = (pageDimensions.width * scale) + (CANVAS_PADDING * 2);
+        const height = (pageDimensions.height * scale) + (CANVAS_PADDING * 2);
 
         // Dispose previous instance to prevent memory leaks
         if (fabricCanvasRef.current) {
             fabricCanvasRef.current.dispose();
         }
 
-        // Create canvas with scaled dimensions to match screen size
+        // Create canvas with scaled dimensions and padding to match screen size
         const canvas = new fabric.Canvas(canvasElRef.current, {
             width,
             height,
@@ -324,8 +382,11 @@ export default function Editor() {
         });
 
         // Set zoom to match the PDF scaling
-        // This ensures coordinates are stored relative to the original PDF size
         canvas.setZoom(scale);
+        
+        // Offset the viewport to account for the CSS padding shift.
+        // This makes logical points (0,0) perfectly match the PDF corner!
+        canvas.setViewportTransform([scale, 0, 0, scale, CANVAS_PADDING, CANVAS_PADDING]);
 
         // Load saved state for this page if it exists
         if (canvasStates.current[currentPage]) {
@@ -338,6 +399,24 @@ export default function Editor() {
         canvas.on('selection:created', handleObjectSelection);
         canvas.on('selection:updated', handleObjectSelection);
         canvas.on('selection:cleared', () => setActiveObject(null));
+
+        // Clip to Page constraints
+        canvas.on('object:moving', (e) => {
+            const obj = e.target;
+            const w = obj.width * obj.scaleX;
+            const h = obj.height * obj.scaleY;
+
+            // Restrict from leaving page completely. Need at least 20 logical pixels inside
+            const minLeft = -w + 20;
+            const maxLeft = pageDimensions.width - 20;
+            const minTop = -h + 20;
+            const maxTop = pageDimensions.height - 20;
+
+            if (obj.left < minLeft) obj.left = minLeft;
+            if (obj.left > maxLeft) obj.left = maxLeft;
+            if (obj.top < minTop) obj.top = minTop;
+            if (obj.top > maxTop) obj.top = maxTop;
+        });
 
         // Add Listeners for Changes to sync with React state
         const syncChanges = () => {
@@ -389,10 +468,10 @@ export default function Editor() {
             const newText = new fabric.Textbox('Type here...', {
                 left: pointer.x,
                 top: pointer.y,
-                width: 200 / zoom, // A reasonable default width, normalized for zoom
+                width: 200 / zoom,
                 fontSize: 16 / zoom,
                 fontFamily: 'DejaVu Sans',
-                lineHeight: 1,
+                lineHeight: 1.0,
                 charSpacing: 0,
                 padding: 0,
                 fill: defaultStyle?.fill || '#000000',
@@ -490,6 +569,15 @@ export default function Editor() {
             canvas.defaultCursor = 'text';
             canvas.hoverCursor = 'text';
             canvas.selection = true;
+        } else if (tool === 'manual-ocr') {
+            canvas.isDrawingMode = false;
+            canvas.defaultCursor = 'crosshair';
+            canvas.hoverCursor = 'crosshair';
+            canvas.selection = false;
+            canvas.forEachObject(obj => {
+                obj.selectable = false;
+                obj.evented = false;
+            });
         } else {
             canvas.isDrawingMode = false;
             canvas.defaultCursor = 'default';
@@ -603,13 +691,14 @@ export default function Editor() {
         currentPageOcrData.text_blocks.forEach(block => {
             const textObj = new fabric.Textbox(block.text, {
                 left: block.rect.x * scaleX,
-                padding: 0,
-                width: block.rect.width * scaleX,
+                padding: 2,
+                splitByGrapheme: false,
+                width: (block.rect.width * scaleX) + 10,
                 height: block.rect.height * scaleY,
                 // USE THE ACTUAL DETECTED FONT SIZE FROM OCR
                 fontSize: block.font_size * scaleY,
                 fontFamily: 'DejaVu Sans',
-                lineHeight: 1,
+                lineHeight: 1.0,
                 charSpacing: 0,
                 textAlign: block.text_align || 'left',
                 // Visibility Logic
@@ -621,7 +710,7 @@ export default function Editor() {
                 originX: 'left',
                 originY: 'top',
                 top: block.rect.y * scaleY,
-                
+
                 // Interactivity Logic
                 selectable: isTextTool || isSelectTool,
                 evented: isTextTool || isSelectTool,
@@ -832,22 +921,25 @@ export default function Editor() {
                                             onRenderSuccess={onPageRenderSuccess}
                                             className="pdf-page"
                                         />
-                                        
+
                                         {/* Fabric.js Drawing Overlay */}
-                                        {/* Ensuring dimensions exactly match the rendered Page size */}
-                                        {pageDimensions && (
-                                            <div style={{
-                                                position: 'absolute',
-                                                top: 0,
-                                                left: 0,
-                                                width: `${pageDimensions.width * (zoom / 100)}px`,
-                                                height: `${pageDimensions.height * (zoom / 100)}px`,
-                                                zIndex: 20,
-                                                pointerEvents: (activeTool === 'pen' || activeTool === 'highlight' || activeTool === 'text' || activeTool === 'select' || activeTool === 'picker') ? 'auto' : 'none'
-                                            }}>
-                                                <canvas ref={canvasElRef} />
-                                            </div>
-                                        )}
+                                        {/* Ensuring dimensions exactly match the rendered Page size but extended by padding offset */}
+                                        {pageDimensions && (() => {
+                                            const CANVAS_PADDING = 40;
+                                            return (
+                                                <div style={{
+                                                    position: 'absolute',
+                                                    top: -CANVAS_PADDING,
+                                                    left: -CANVAS_PADDING,
+                                                    width: `${pageDimensions.width * (zoom / 100) + CANVAS_PADDING * 2}px`,
+                                                    height: `${pageDimensions.height * (zoom / 100) + CANVAS_PADDING * 2}px`,
+                                                    zIndex: 20,
+                                                    pointerEvents: (activeTool === 'pen' || activeTool === 'highlight' || activeTool === 'text' || activeTool === 'select' || activeTool === 'picker') ? 'auto' : 'none'
+                                                }}>
+                                                    <canvas ref={canvasElRef} />
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
                                 </Document>
                             </div>

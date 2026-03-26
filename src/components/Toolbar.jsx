@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
     Type, Pen, Image, Square, Pencil, Highlighter, Download, Save, Share2,
     MousePointer, Hand, ZoomIn, ZoomOut, ChevronLeft, ChevronRight,
-    Undo, Redo, Printer, Loader, Pipette
+    Undo, Redo, Printer, Loader, Pipette, Scan
 } from 'lucide-react';
 import { exportEditedPdf, downloadOriginalPdf } from '../utils/pdfExport';
 
@@ -37,7 +37,8 @@ export default function Toolbar({
         { id: 'highlight', icon: Highlighter, label: 'Highlight' },
         { id: 'picker', icon: Pipette, label: 'Pick Color' },
         { id: 'image', icon: Image, label: 'Image' },
-        { id: 'shape', icon: Square, label: 'Shape' }
+        { id: 'shape', icon: Square, label: 'Shape' },
+        { id: 'manual-ocr', icon: Scan, label: 'Manual OCR' }
     ];
 
     const handleExport = async () => {

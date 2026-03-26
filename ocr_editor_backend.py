@@ -41,6 +41,35 @@ def clean_background_region(image_cv, x, y, w, h):
     
     return inpainted_img
 
+def convert_to_high_quality(image_path, target_format="TIFF"):
+    """
+    Converts the image to a high-quality format (TIFF or BMP) if it does not already
+    exist in one of those formats. This is crucial for OCR engines which perform
+    best on high-quality, uncompressed or lossless image formats.
+    """
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in ['.tif', '.tiff', '.bmp']:
+        return image_path
+        
+    try:
+        img = Image.open(image_path)
+        # Convert to RGB to avoid issues saving certain modes (like RGBA)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+            
+        new_path = os.path.splitext(image_path)[0] + f'.{target_format.lower()}'
+        
+        # Save with high DPI for better OCR results if saving as TIFF
+        if target_format.upper() == 'TIFF':
+            img.save(new_path, format='TIFF', dpi=(300, 300))
+        else:
+            img.save(new_path, format=target_format.upper())
+            
+        return new_path
+    except Exception as e:
+        print(f"Warning: Could not convert image to {target_format}: {e}")
+        return image_path
+
 def process_scanned_image(image_path, edits, output_path):
     """
     Applies text edits to a scanned image and saves the result.
@@ -55,10 +84,13 @@ def process_scanned_image(image_path, edits, output_path):
         output_path (str): Where to save the final image/PDF.
     """
     
+    # Ensure image is in a high-quality format (TIFF/BMP) for better OCR results
+    hq_image_path = convert_to_high_quality(image_path)
+
     # 1. Load the image using OpenCV
-    img_cv = cv2.imread(image_path)
+    img_cv = cv2.imread(hq_image_path)
     if img_cv is None:
-        raise ValueError(f"Could not load image: {image_path}")
+        raise ValueError(f"Could not load image: {hq_image_path}")
 
     # 2. Pass 1: Erase old text (Inpainting)
     for edit in edits:

@@ -4,7 +4,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from celery.result import AsyncResult
-from .tasks import ocr_process_pdf, apply_pdf_changes
+from .tasks import ocr_process_pdf, apply_pdf_changes, ocr_targeted_crop
 
 
 @csrf_exempt
@@ -113,3 +113,41 @@ def task_status(request, task_id):
         response['error'] = str(task_result.result)
         
     return JsonResponse(response)
+
+
+@csrf_exempt
+def targeted_ocr(request):
+    """
+    Perform OCR on a specific rectangular area of a PDF page.
+    
+    POST /api/ocr/targeted/
+    Body: {
+        "filename": "server_filename.pdf",
+        "page": 1,
+        "rect": {"x": 10, "y": 10, "w": 100, "h": 20}
+    }
+    """
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            filename = data.get('filename')
+            page_num = data.get('page')
+            rect = data.get('rect')
+            
+            if not all([filename, page_num, rect]):
+                return JsonResponse({'error': 'Missing filename, page, or rect'}, status=400)
+
+            file_path = os.path.join(settings.MEDIA_ROOT, 'uploads', filename)
+            
+            if not os.path.exists(file_path):
+                return JsonResponse({'error': 'File not found'}, status=404)
+
+            # Trigger the targeted OCR task
+            task = ocr_targeted_crop.delay(file_path, page_num, rect)
+            
+            return JsonResponse({'task_id': task.id})
+            
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+            
+    return JsonResponse({'error': 'POST required'}, status=405)

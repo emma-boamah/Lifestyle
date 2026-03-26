@@ -152,8 +152,8 @@ def process_pil_image(pil_image, edits):
         else:
             bg_sampled = _sample_background_color(pil_img_out, ox, oy, ow, oh)
         
-        # Erase by filling with background color (pad slightly more to ensure full coverage)
-        pad = 4
+        # Erase by filling with background color (pad minimally to avoid over-erasing adjacent lines)
+        pad = 1
         x1 = max(0, ox - pad)
         y1 = max(0, oy - pad)
         x2 = ox + ow + pad
@@ -173,9 +173,7 @@ def process_pil_image(pil_image, edits):
         fill_color = edit.get('fill_color', '#000000')
         bg_color = edit.get('bg_color', None)
         
-        # Get font with size correction (Frontend sends pixels @ 150 DPI, Pillow expects points @ 72 DPI)
-        # However, Pillow's truetype size is usually interpreted as pixels if no DPI is specified.
-        # But for consistency with standard rendering, we ensure a healthy minimum.
+        # Get font with size correction
         font_size = max(8, font_size)
         font = _get_font(font_size)
         
@@ -183,7 +181,6 @@ def process_pil_image(pil_image, edits):
         text_align = edit.get('text_align', 'left').lower()
         
         # For any modified text block, fill the target area with background first IF provided
-        # This helps cover any missed stray pixels from the original text
         if bg_color and bg_color != 'transparent':
             bg_rgb = _hex_to_rgb(bg_color)
             draw.rectangle([x, y, x + w, y + h], fill=bg_rgb)
@@ -191,20 +188,30 @@ def process_pil_image(pil_image, edits):
         # Draw the text
         text_rgb = _hex_to_rgb(fill_color)
         
-        # Get the width of the text with the current font
-        # Use getlength for consistency and accuracy in pixel width
-        text_width = font.getlength(text_content)
-        
         # 1. Best-Fit Font Scaling:
-        # If text is too wide for the box, reduce font size until it fits
-        while text_width > w and font_size > 6:
+        # If text is too wide OR too tall for the box, reduce font size until it fits
+        def check_fit(f, t, target_w, target_h):
+            # getbbox returns (left, top, right, bottom)
+            bbox = f.getbbox(t)
+            if not bbox: return True
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            return tw <= target_w and th <= target_h
+
+        while not check_fit(font, text_content, w, h) and font_size > 6:
             font_size -= 1
             font = _get_font(font_size)
-            text_width = font.getlength(text_content)
             
         # 2. Alignment Anchor logic:
-        # We always center vertically in the box for visual consistency with OCR
-        center_y = y + (h / 2)
+        # We always center vertically in the box for visual consistency
+        # Precise vertical centering using bbox
+        bbox = font.getbbox(text_content)
+        if bbox:
+            text_height = bbox[3] - bbox[1]
+            # middle-middle anchor "mm" aligns the font's middle-line with our center_y
+            center_y = y + (h / 2)
+        else:
+            center_y = y + (h / 2)
         
         if text_align == 'center':
             draw_pos = (x + (w / 2), center_y)
