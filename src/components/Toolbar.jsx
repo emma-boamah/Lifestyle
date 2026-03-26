@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
     Type, Pen, Image, Square, Pencil, Highlighter, Download, Save, Share2,
     MousePointer, Hand, ZoomIn, ZoomOut, ChevronLeft, ChevronRight,
-    Undo, Redo, Printer, Loader, Pipette, Scan
+    Undo, Redo, Printer, Loader, Pipette, Scan, Eye
 } from 'lucide-react';
 import { exportEditedPdf, downloadOriginalPdf } from '../utils/pdfExport';
 
@@ -23,7 +23,8 @@ export default function Toolbar({
     defaultStyle,
     setDefaultStyle,
     onExport,
-    onSave
+    onSave,
+    onPreview
 }) {
     const [isExporting, setIsExporting] = useState(false);
 
@@ -190,6 +191,14 @@ export default function Toolbar({
                 <button className="btn btn-secondary" title="Share">
                     <Share2 size={18} />
                     Share
+                </button>
+                <button
+                    className="btn btn-secondary"
+                    onClick={() => onPreview && onPreview(currentPage)}
+                    title="Live Preview"
+                >
+                    <Eye size={18} />
+                    Preview
                 </button>
                 <button
                     className="btn btn-primary"
