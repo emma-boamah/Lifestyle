@@ -6,4 +6,5 @@ urlpatterns = [
     path('tasks/<str:task_id>/status/', views.task_status, name='task_status'),
     path('save/', views.save_pdf_edits, name='save_pdf_edits'),
     path('ocr/targeted/', views.targeted_ocr, name='targeted_ocr'),
+    path('preview/', views.preview_pdf_edits, name='preview_pdf_edits'),
 ]

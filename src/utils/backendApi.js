@@ -79,3 +79,38 @@ export async function pollTaskStatus(taskId, onProgress) {
         }, 2000);
     });
 }
+
+/**
+ * Previews PDF changes by returning a base64 encoded image of the edited page.
+ * 
+ * @param {string} serverFilename - The filename on the server
+ * @param {number} page - The current page number
+ * @param {Array} changes - Array of change objects
+ * @returns {Promise<string>} - Base64 image data URI
+ */
+export async function previewPdfChanges(serverFilename, page, changes) {
+    const response = await fetch('/api/preview/', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            filename: serverFilename,
+            page: page,
+            changes: changes
+        })
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        try {
+            const err = JSON.parse(text);
+            throw new Error(err.error || 'Preview failed');
+        } catch (e) {
+            throw new Error(`Preview failed with status ${response.status}`);
+        }
+    }
+
+    const data = await response.json();
+    return data.image;
+}

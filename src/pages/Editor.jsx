@@ -6,7 +6,7 @@ import * as fabric from 'fabric';
 import Sidebar from '../components/Sidebar';
 import Toolbar from '../components/Toolbar';
 import PropertiesPanel from '../components/PropertiesPanel';
-import { savePdfChanges, pollTaskStatus } from '../utils/backendApi';
+import { savePdfChanges, pollTaskStatus, previewPdfChanges } from '../utils/backendApi';
 
 // Add new API helper for targeted OCR
 const startTargetedOcr = async (filename, page, rect) => {
@@ -195,6 +195,33 @@ export default function Editor() {
         }
     };
 
+    // Handle Live Preview
+    const handlePreview = async (page) => {
+        const changes = getChangesFromCanvas();
+        if (changes.length === 0) {
+            alert('No changes to preview.');
+            return;
+        }
+
+        const serverFilename = location.state?.serverFilename || fileName;
+        if (!serverFilename) {
+            alert('No server file attached. Cannot generate preview.');
+            return;
+        }
+
+        setIsPreviewLoading(true);
+        setIsPreviewOpen(true);
+        try {
+            const b64Image = await previewPdfChanges(serverFilename, page, changes);
+            setPreviewImageBase64(b64Image);
+        } catch (error) {
+            alert('Preview failed: ' + error.message);
+            setIsPreviewOpen(false);
+        } finally {
+            setIsPreviewLoading(false);
+        }
+    };
+
     // UI State
     const [zoom, setZoom] = useState(100);
     const [activeTool, setActiveTool] = useState('select');
@@ -213,6 +240,11 @@ export default function Editor() {
     // PDF Load Status
     const [isPdfLoaded, setIsPdfLoaded] = useState(false);
     const [pdfError, setPdfError] = useState(null);
+
+    // Preview Status
+    const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+    const [previewImageBase64, setPreviewImageBase64] = useState(null);
+    const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
     // Fabric.js State
     const fabricCanvasRef = useRef(null);
@@ -877,6 +909,7 @@ export default function Editor() {
                     setDefaultStyle={setDefaultStyle}
                     onExport={handleBackendExport}
                     onSave={handleSaveChanges}
+                    onPreview={handlePreview}
                 />
 
                 <div className="canvas-area" onClick={handleCanvasClick}>
@@ -980,6 +1013,52 @@ export default function Editor() {
                 activeObject={activeObject}
                 onUpdateObject={onUpdateObject}
             />
+
+            {/* Live Preview Modal */}
+            {isPreviewOpen && (
+                <div style={{
+                    position: 'fixed',
+                    inset: 0,
+                    backgroundColor: 'rgba(0,0,0,0.8)',
+                    zIndex: 9999,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '2rem'
+                }}>
+                    <div style={{
+                        background: 'white',
+                        padding: '1rem',
+                        borderRadius: '8px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        width: '90%',
+                        maxWidth: '1200px',
+                        maxHeight: '90vh'
+                    }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1rem', alignItems: 'center' }}>
+                            <h3 style={{ margin: 0, fontWeight: 600 }}>Live Burn-In Preview</h3>
+                            <button 
+                                onClick={() => { setIsPreviewOpen(false); setPreviewImageBase64(null); }}
+                                style={{ background: '#f3f4f6', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 600 }}
+                            >
+                                Close
+                            </button>
+                        </div>
+                        <div style={{ flex: 1, overflow: 'auto', background: '#e5e7eb', display: 'flex', justifyContent: 'center', alignItems: 'flex-start', padding: '1rem' }}>
+                            {isPreviewLoading ? (
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', minHeight: '300px' }}>
+                                    <Loader size={48} className="spin" style={{ color: 'var(--color-primary)' }} />
+                                    <p style={{ marginTop: '1rem', fontWeight: 500, color: '#4b5563' }}>Generating Live Preview...</p>
+                                </div>
+                            ) : (
+                                previewImageBase64 && <img src={previewImageBase64} alt="PDF Preview" style={{ boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)', maxWidth: '100%', height: 'auto' }} />
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
